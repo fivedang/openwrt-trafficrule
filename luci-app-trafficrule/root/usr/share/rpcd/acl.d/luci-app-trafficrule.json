@@ -1,0 +1,27 @@
+{
+	"luci-app-trafficrule": {
+		"description": "Grant access to TrafficRule",
+		"read": {
+			"ubus": {
+				"luci.trafficrule": [
+					"get_status",
+					"get_devices",
+					"get_domains",
+					"get_proxy_groups"
+				]
+			},
+			"uci": ["trafficrule"]
+		},
+		"write": {
+			"ubus": {
+				"luci.trafficrule": [
+					"set_monitor",
+					"domain_action",
+					"service_action",
+					"apply_rules"
+				]
+			},
+			"uci": ["trafficrule"]
+		}
+	}
+}

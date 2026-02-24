@@ -1,0 +1,315 @@
+#!/bin/sh
+# rpcd backend for luci-app-trafficrule
+# Communicates via stdin/stdout JSON with rpcd
+
+. /usr/share/libubox/jshn.sh
+. /lib/functions.sh
+. /usr/lib/trafficrule/common.sh
+
+load_config
+ensure_dirs
+
+# ── helpers ──────────────────────────────────────
+
+json_init_reply() {
+	json_init
+}
+
+json_dump_reply() {
+	json_dump
+	json_cleanup
+}
+
+# Read a domain list file and output as JSON array
+domains_to_json_array() {
+	local file="$1"
+	local first=1
+	printf '['
+	if [ -f "$file" ] && [ -s "$file" ]; then
+		sort -u "$file" | while IFS= read -r d; do
+			[ -z "$d" ] && continue
+			if [ "$first" = "1" ]; then
+				first=0
+				printf '"%s"' "$d"
+			else
+				printf ',"%s"' "$d"
+			fi
+		done
+	fi
+	printf ']'
+}
+
+# ── RPC method implementations ──────────────────
+
+method_get_status() {
+	local running=0
+	local enabled="$TR_ENABLED"
+	local target_ip="$TR_TARGET_IP"
+	local interface="$TR_INTERFACE"
+	local proxy_group="$TR_PROXY_GROUP"
+	local direct_group="$TR_DIRECT_GROUP"
+
+	pgrep -f trafficrule-capture >/dev/null 2>&1 && running=1
+
+	local pending_count approved_count direct_count ignored_count
+	pending_count="$(count_lines "$PENDING_FILE")"
+	approved_count="$(count_lines "$APPROVED_FILE")"
+	direct_count="$(count_lines "$DIRECT_FILE")"
+	ignored_count="$(count_lines "$IGNORED_FILE")"
+
+	local active_session=""
+	[ -f "$ACTIVE_SESSION_FILE" ] && active_session="$(cat "$ACTIVE_SESSION_FILE")"
+
+	local capture_start=""
+	[ -f "$CAPTURE_START_FILE" ] && capture_start="$(cat "$CAPTURE_START_FILE")"
+
+	json_init_reply
+	json_add_boolean "running" "$running"
+	json_add_string "enabled" "$enabled"
+	json_add_string "target_ip" "$target_ip"
+	json_add_string "interface" "$interface"
+	json_add_string "proxy_group" "$proxy_group"
+	json_add_string "direct_group" "$direct_group"
+	json_add_int "pending" "$pending_count"
+	json_add_int "approved" "$approved_count"
+	json_add_int "direct" "$direct_count"
+	json_add_int "ignored" "$ignored_count"
+	json_add_string "active_session" "$active_session"
+	json_add_string "capture_start" "$capture_start"
+	json_dump_reply
+}
+
+method_get_devices() {
+	local lease_file="/tmp/dhcp.leases"
+	local current_ip="$TR_TARGET_IP"
+
+	printf '{"devices":['
+	local first=1
+	if [ -f "$lease_file" ]; then
+		while read -r _ts mac ip hostname _rest; do
+			[ -z "$ip" ] && continue
+			local name="${hostname:-}"
+			[ "$name" = "*" ] && name=""
+			local monitoring=0
+			[ "$ip" = "$current_ip" ] && monitoring=1
+
+			if [ "$first" = "1" ]; then
+				first=0
+			else
+				printf ','
+			fi
+			printf '{"ip":"%s","hostname":"%s","mac":"%s","monitoring":%s}' \
+				"$ip" "$name" "$mac" "$monitoring"
+		done < "$lease_file"
+	fi
+	printf ']}'
+}
+
+method_get_domains() {
+	local dtype
+	json_get_var dtype type 2>/dev/null || dtype="pending"
+	[ -z "$dtype" ] && dtype="pending"
+
+	local file
+	case "$dtype" in
+		pending)  file="$PENDING_FILE" ;;
+		approved) file="$APPROVED_FILE" ;;
+		direct)   file="$DIRECT_FILE" ;;
+		ignored)  file="$IGNORED_FILE" ;;
+		*) printf '{"error":"unknown type"}'; return ;;
+	esac
+
+	printf '{"type":"%s","domains":' "$dtype"
+	domains_to_json_array "$file"
+	printf '}'
+}
+
+method_get_proxy_groups() {
+	local groups=""
+	local config_path=""
+
+	# Try to get OpenClash config path from UCI
+	config_path="$(uci -q get openclash.config.config_path)"
+
+	# If empty, scan for yaml files
+	if [ -z "$config_path" ] || [ ! -f "$config_path" ]; then
+		for f in /etc/openclash/config/*.yaml /etc/openclash/config/*.yml; do
+			if [ -f "$f" ]; then
+				config_path="$f"
+				break
+			fi
+		done
+	fi
+
+	# Extract proxy-group names from YAML
+	local yaml_groups=""
+	if [ -n "$config_path" ] && [ -f "$config_path" ]; then
+		yaml_groups="$(sed -n '/^proxy-groups:/,/^[^ ]/{ /^  *- name: /{ s/^  *- name: *//; s/ *$//; s/^["'"'"']//; s/["'"'"']$//; p; }; }' "$config_path" 2>/dev/null)"
+	fi
+
+	printf '{"groups":['
+	local first=1
+	# Always include built-in options
+	printf '"DIRECT","REJECT"'
+	first=0
+
+	# Add parsed groups (deduplicated against built-ins)
+	if [ -n "$yaml_groups" ]; then
+		echo "$yaml_groups" | while IFS= read -r g; do
+			[ -z "$g" ] && continue
+			[ "$g" = "DIRECT" ] && continue
+			[ "$g" = "REJECT" ] && continue
+			printf ',"%s"' "$g"
+		done
+	fi
+	printf ']}'
+}
+
+method_set_monitor() {
+	local ip
+	json_get_var ip ip 2>/dev/null
+	if [ -z "$ip" ]; then
+		printf '{"error":"missing ip parameter"}'
+		return
+	fi
+
+	local output
+	output="$(trafficrule monitor "$ip" 2>&1)"
+	local rc=$?
+
+	json_init_reply
+	json_add_int "code" "$rc"
+	json_add_string "stdout" "$output"
+	json_dump_reply
+}
+
+method_domain_action() {
+	local action domains_str
+	json_get_var action action 2>/dev/null
+	json_get_values domains_str domains 2>/dev/null
+
+	if [ -z "$action" ]; then
+		printf '{"error":"missing action parameter"}'
+		return
+	fi
+
+	local count=0
+	local errors=""
+
+	for domain in $domains_str; do
+		[ -z "$domain" ] && continue
+		local out=""
+		case "$action" in
+			proxy)
+				out="$(trafficrule approve "$domain" 2>&1)"
+				;;
+			direct)
+				out="$(trafficrule direct "$domain" 2>&1)"
+				;;
+			ignore)
+				out="$(trafficrule ignore "$domain" 2>&1)"
+				;;
+			remove_approved)
+				out="$(trafficrule remove approved "$domain" 2>&1)"
+				;;
+			remove_direct)
+				out="$(trafficrule remove direct "$domain" 2>&1)"
+				;;
+			remove_ignored)
+				# Remove from ignored: delete line from ignored file
+				if [ -f "$IGNORED_FILE" ]; then
+					local tmpf="${IGNORED_FILE}.tmp"
+					grep -vxF "$domain" "$IGNORED_FILE" > "$tmpf" 2>/dev/null || true
+					mv "$tmpf" "$IGNORED_FILE"
+				fi
+				;;
+			*)
+				errors="${errors}unknown action: $action; "
+				continue
+				;;
+		esac
+		count=$((count + 1))
+	done
+
+	json_init_reply
+	json_add_int "count" "$count"
+	json_add_string "errors" "$errors"
+	json_dump_reply
+}
+
+method_service_action() {
+	local action
+	json_get_var action action 2>/dev/null
+
+	local output rc
+	case "$action" in
+		start)
+			output="$(trafficrule start 2>&1)"
+			rc=$?
+			;;
+		stop)
+			output="$(trafficrule stop 2>&1)"
+			rc=$?
+			;;
+		restart)
+			output="$(trafficrule stop 2>&1; trafficrule start 2>&1)"
+			rc=$?
+			;;
+		*)
+			printf '{"error":"unknown action"}'
+			return
+			;;
+	esac
+
+	json_init_reply
+	json_add_int "code" "$rc"
+	json_add_string "stdout" "$output"
+	json_dump_reply
+}
+
+method_apply_rules() {
+	local output
+	output="$(trafficrule apply 2>&1)"
+	local rc=$?
+
+	json_init_reply
+	json_add_int "code" "$rc"
+	json_add_string "stdout" "$output"
+	json_dump_reply
+}
+
+# ── rpcd dispatch ────────────────────────────────
+
+case "$1" in
+	list)
+		# Advertise available methods and their parameters
+		printf '{'
+		printf '"get_status":{},'
+		printf '"get_devices":{},'
+		printf '"get_domains":{"type":"str"},'
+		printf '"get_proxy_groups":{},'
+		printf '"set_monitor":{"ip":"str"},'
+		printf '"domain_action":{"action":"str","domains":"array"},'
+		printf '"service_action":{"action":"str"},'
+		printf '"apply_rules":{}'
+		printf '}'
+		;;
+	call)
+		method="$2"
+		# Parse JSON input from stdin
+		json_init
+		json_load "$(cat)"
+
+		case "$method" in
+			get_status)       method_get_status ;;
+			get_devices)      method_get_devices ;;
+			get_domains)      method_get_domains ;;
+			get_proxy_groups) method_get_proxy_groups ;;
+			set_monitor)      method_set_monitor ;;
+			domain_action)    method_domain_action ;;
+			service_action)   method_service_action ;;
+			apply_rules)      method_apply_rules ;;
+			*)                printf '{"error":"unknown method"}' ;;
+		esac
+		;;
+esac

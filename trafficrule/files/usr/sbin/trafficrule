@@ -1,0 +1,903 @@
+#!/bin/sh
+# trafficrule - CLI management tool for traffic capture to OpenClash rules
+
+. /lib/functions.sh
+. /usr/lib/trafficrule/common.sh
+
+load_config
+ensure_dirs
+
+usage() {
+    cat <<'EOF'
+Usage: trafficrule <command> [options]
+
+Commands:
+  start                          Start capture service
+  stop                           Stop capture service
+  status                         Show service status and statistics
+  monitor <IP>                   Switch to monitoring a new IP (clears pending)
+  devices                        List LAN devices from DHCP leases
+  list [pending|approved|direct|ignored] List domains (default: pending)
+  approve [--session <name>] <domain|all>  Route domain(s) via proxy
+  direct  [--session <name>] <domain|all>  Route domain(s) directly
+  ignore  [--session <name>] <domain|all>  Ignore domain(s)
+  remove <approved|direct> <domain>  Remove domain from a list
+  apply                          Write rules to OpenClash and optionally reload
+  clear [pending|approved|direct|ignored] Clear a domain list
+  reset                          Reset all state (pending, sessions)
+  session <subcommand>           Manage capture sessions
+
+Session subcommands:
+  session start <name>           Start a named capture session
+  session stop                   Stop the current session
+  session status                 Show active session
+  session list                   List all sessions
+  session show <name>            Show domains captured in a session
+  session delete <name>          Delete a session and its data
+EOF
+    exit 1
+}
+
+# ──────────────────────────────────────────────
+# Service control
+# ──────────────────────────────────────────────
+
+cmd_start() {
+    # Stop any existing capture via procd (never use killall)
+    /etc/init.d/trafficrule stop 2>/dev/null
+    sleep 1
+
+    # Clear pending for a fresh capture
+    > "$PENDING_FILE"
+
+    # Record capture start time
+    date '+%Y-%m-%d %H:%M:%S' > "$CAPTURE_START_FILE"
+
+    # Start service via procd
+    /etc/init.d/trafficrule start
+}
+
+cmd_stop() {
+    /etc/init.d/trafficrule stop
+}
+
+cmd_status() {
+    echo "=== trafficrule status ==="
+    echo ""
+
+    # Service status
+    if pgrep -f trafficrule-capture >/dev/null 2>&1; then
+        echo "Service: RUNNING"
+        local pids
+        pids="$(pgrep -f trafficrule-capture 2>/dev/null | tr '\n' ' ')"
+        echo "  PIDs: $pids"
+    else
+        echo "Service: STOPPED"
+    fi
+
+    echo ""
+    echo "Config:"
+    echo "  enabled=$TR_ENABLED"
+    echo "  target_ip=$TR_TARGET_IP"
+    echo "  interface=$TR_INTERFACE"
+    echo "  proxy_group=$TR_PROXY_GROUP"
+    echo "  direct_group=$TR_DIRECT_GROUP"
+    echo "  capture_dns=$TR_CAPTURE_DNS"
+    echo "  capture_sni=$TR_CAPTURE_SNI"
+
+    echo ""
+    echo "Domain counts:"
+    echo "  pending:  $(count_lines "$PENDING_FILE")"
+    echo "  approved: $(count_lines "$APPROVED_FILE")"
+    echo "  direct:   $(count_lines "$DIRECT_FILE")"
+    echo "  ignored:  $(count_lines "$IGNORED_FILE")"
+
+    # Active session
+    local session
+    session="$(get_active_session)"
+    echo ""
+    if [ -n "$session" ]; then
+        local sfile="${SESSION_TMP_DIR}/${session}.txt"
+        echo "Active session: $session ($(count_lines "$sfile") domains)"
+    else
+        echo "Active session: (none)"
+    fi
+
+    # Rule provider status
+    echo ""
+    if [ -f "$RULE_PROVIDER_FILE" ]; then
+        local rcount
+        rcount="$(grep -c '^ *- ' "$RULE_PROVIDER_FILE" 2>/dev/null || echo 0)"
+        echo "Proxy rule provider: $RULE_PROVIDER_FILE ($rcount domains)"
+    else
+        echo "Proxy rule provider: not generated yet"
+    fi
+    if [ -f "$DIRECT_RULE_PROVIDER_FILE" ]; then
+        local dcount
+        dcount="$(grep -c '^ *- ' "$DIRECT_RULE_PROVIDER_FILE" 2>/dev/null || echo 0)"
+        echo "Direct rule provider: $DIRECT_RULE_PROVIDER_FILE ($dcount domains)"
+    else
+        echo "Direct rule provider: not generated yet"
+    fi
+}
+
+# ──────────────────────────────────────────────
+# Monitor / Devices
+# ──────────────────────────────────────────────
+
+cmd_monitor() {
+    local new_ip="$1"
+    if [ -z "$new_ip" ]; then
+        echo "Error: specify an IP address."
+        echo "Usage: trafficrule monitor <IP>"
+        exit 1
+    fi
+
+    echo "Switching monitoring to $new_ip ..."
+
+    # 1. Stop current service via procd (never use killall)
+    /etc/init.d/trafficrule stop 2>/dev/null
+    sleep 1
+
+    # 2. Clear pending list and session temp data (approved/ignored preserved)
+    > "$PENDING_FILE"
+    rm -rf "${SESSION_TMP_DIR:?}/"*
+    rm -f "$ACTIVE_SESSION_FILE"
+
+    # 3. Record capture start time
+    date '+%Y-%m-%d %H:%M:%S' > "$CAPTURE_START_FILE"
+
+    # 4. Update UCI config
+    uci set trafficrule.global.target_ip="$new_ip"
+    uci set trafficrule.global.enabled='1'
+    uci commit trafficrule
+
+    # 5. Reload config vars and start service
+    load_config
+    /etc/init.d/trafficrule start
+
+    # 6. Confirmation
+    echo ""
+    echo "Done. Now monitoring: $new_ip"
+    echo "  pending list cleared (approved/ignored preserved)"
+    echo "  service started"
+}
+
+cmd_devices() {
+    local lease_file="/tmp/dhcp.leases"
+    if [ ! -f "$lease_file" ]; then
+        echo "No DHCP lease file found at $lease_file"
+        return
+    fi
+
+    local current_ip="$TR_TARGET_IP"
+
+    printf "%-16s %-24s %-18s %s\n" "IP" "Hostname" "MAC" ""
+    printf "%-16s %-24s %-18s %s\n" "──────────────" "──────────────────────" "─────────────────" ""
+
+    while read -r _ts mac ip hostname _rest; do
+        [ -z "$ip" ] && continue
+        local name="${hostname:-*}"
+        [ "$name" = "*" ] && name="-"
+        local marker=""
+        [ "$ip" = "$current_ip" ] && marker="[MONITORING]"
+        printf "%-16s %-24s %-18s %s\n" "$ip" "$name" "$mac" "$marker"
+    done < "$lease_file"
+}
+
+# ──────────────────────────────────────────────
+# Domain list operations
+# ──────────────────────────────────────────────
+
+cmd_list() {
+    local which="${1:-pending}"
+    local file
+    case "$which" in
+        pending)  file="$PENDING_FILE" ;;
+        approved) file="$APPROVED_FILE" ;;
+        direct)   file="$DIRECT_FILE" ;;
+        ignored)  file="$IGNORED_FILE" ;;
+        *)
+            echo "Error: unknown list '$which'. Use pending, approved, direct, or ignored."
+            exit 1
+            ;;
+    esac
+
+    if [ ! -s "$file" ]; then
+        echo "($which list is empty)"
+        return
+    fi
+
+    echo "=== $which domains ($(count_lines "$file")) ==="
+    sort "$file"
+}
+
+cmd_approve() {
+    local session=""
+    local target=""
+
+    # Parse arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --session)
+                shift
+                session="$1"
+                ;;
+            *)
+                target="$1"
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$target" ]; then
+        echo "Error: specify a domain or 'all'"
+        exit 1
+    fi
+
+    local source_file
+    if [ -n "$session" ]; then
+        source_file="${SESSION_TMP_DIR}/${session}.txt"
+        if [ ! -f "$source_file" ]; then
+            echo "Error: session '$session' not found"
+            exit 1
+        fi
+    else
+        source_file="$PENDING_FILE"
+    fi
+
+    acquire_lock || exit 1
+
+    if [ "$target" = "all" ]; then
+        if [ ! -s "$source_file" ]; then
+            echo "No domains to approve."
+            release_lock
+            return
+        fi
+        local count=0
+        while IFS= read -r domain; do
+            [ -z "$domain" ] && continue
+            if ! domain_in_file "$domain" "$APPROVED_FILE"; then
+                echo "$domain" >> "$APPROVED_FILE"
+                count=$((count + 1))
+            fi
+            # Mutual exclusivity: remove from direct and ignored
+            remove_domain_from_file "$domain" "$DIRECT_FILE"
+            remove_domain_from_file "$domain" "$IGNORED_FILE"
+        done < "$source_file"
+
+        # Remove approved domains from pending
+        remove_domains_bulk "$APPROVED_FILE" "$PENDING_FILE"
+
+        echo "Approved $count domain(s)."
+    else
+        if domain_in_file "$target" "$APPROVED_FILE"; then
+            echo "'$target' is already approved."
+        else
+            echo "$target" >> "$APPROVED_FILE"
+            echo "Approved: $target"
+        fi
+        # Mutual exclusivity: remove from other lists
+        remove_domain_from_file "$target" "$DIRECT_FILE"
+        remove_domain_from_file "$target" "$IGNORED_FILE"
+        remove_domain_from_file "$target" "$PENDING_FILE"
+    fi
+
+    release_lock
+}
+
+cmd_direct() {
+    local session=""
+    local target=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --session)
+                shift
+                session="$1"
+                ;;
+            *)
+                target="$1"
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$target" ]; then
+        echo "Error: specify a domain or 'all'"
+        exit 1
+    fi
+
+    local source_file
+    if [ -n "$session" ]; then
+        source_file="${SESSION_TMP_DIR}/${session}.txt"
+        if [ ! -f "$source_file" ]; then
+            echo "Error: session '$session' not found"
+            exit 1
+        fi
+    else
+        source_file="$PENDING_FILE"
+    fi
+
+    acquire_lock || exit 1
+
+    if [ "$target" = "all" ]; then
+        if [ ! -s "$source_file" ]; then
+            echo "No domains to route direct."
+            release_lock
+            return
+        fi
+        local count=0
+        while IFS= read -r domain; do
+            [ -z "$domain" ] && continue
+            if ! domain_in_file "$domain" "$DIRECT_FILE"; then
+                echo "$domain" >> "$DIRECT_FILE"
+                count=$((count + 1))
+            fi
+            # Mutual exclusivity: remove from proxy and ignored
+            remove_domain_from_file "$domain" "$APPROVED_FILE"
+            remove_domain_from_file "$domain" "$IGNORED_FILE"
+        done < "$source_file"
+
+        # Remove direct domains from pending
+        remove_domains_bulk "$DIRECT_FILE" "$PENDING_FILE"
+
+        echo "Routed direct: $count domain(s)."
+    else
+        if domain_in_file "$target" "$DIRECT_FILE"; then
+            echo "'$target' is already in direct list."
+        else
+            echo "$target" >> "$DIRECT_FILE"
+            echo "Routed direct: $target"
+        fi
+        # Mutual exclusivity: remove from other lists
+        remove_domain_from_file "$target" "$APPROVED_FILE"
+        remove_domain_from_file "$target" "$IGNORED_FILE"
+        remove_domain_from_file "$target" "$PENDING_FILE"
+    fi
+
+    release_lock
+}
+
+cmd_ignore() {
+    local session=""
+    local target=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --session)
+                shift
+                session="$1"
+                ;;
+            *)
+                target="$1"
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$target" ]; then
+        echo "Error: specify a domain or 'all'"
+        exit 1
+    fi
+
+    local source_file
+    if [ -n "$session" ]; then
+        source_file="${SESSION_TMP_DIR}/${session}.txt"
+        if [ ! -f "$source_file" ]; then
+            echo "Error: session '$session' not found"
+            exit 1
+        fi
+    else
+        source_file="$PENDING_FILE"
+    fi
+
+    acquire_lock || exit 1
+
+    if [ "$target" = "all" ]; then
+        if [ ! -s "$source_file" ]; then
+            echo "No domains to ignore."
+            release_lock
+            return
+        fi
+        local count=0
+        while IFS= read -r domain; do
+            [ -z "$domain" ] && continue
+            if ! domain_in_file "$domain" "$IGNORED_FILE"; then
+                echo "$domain" >> "$IGNORED_FILE"
+                count=$((count + 1))
+            fi
+            # Mutual exclusivity: remove from proxy and direct
+            remove_domain_from_file "$domain" "$APPROVED_FILE"
+            remove_domain_from_file "$domain" "$DIRECT_FILE"
+        done < "$source_file"
+
+        # Remove ignored domains from pending
+        remove_domains_bulk "$IGNORED_FILE" "$PENDING_FILE"
+
+        echo "Ignored $count domain(s)."
+    else
+        if domain_in_file "$target" "$IGNORED_FILE"; then
+            echo "'$target' is already ignored."
+        else
+            echo "$target" >> "$IGNORED_FILE"
+            echo "Ignored: $target"
+        fi
+        # Mutual exclusivity: remove from other lists
+        remove_domain_from_file "$target" "$APPROVED_FILE"
+        remove_domain_from_file "$target" "$DIRECT_FILE"
+        remove_domain_from_file "$target" "$PENDING_FILE"
+    fi
+
+    release_lock
+}
+
+cmd_remove() {
+    local list_name="$1"
+    local domain="$2"
+
+    # Backward compatibility: if only one arg, treat as domain from approved
+    if [ -z "$domain" ]; then
+        domain="$list_name"
+        list_name="approved"
+    fi
+
+    [ -z "$domain" ] && { echo "Error: specify a domain to remove"; exit 1; }
+
+    local target_file
+    case "$list_name" in
+        approved) target_file="$APPROVED_FILE" ;;
+        direct)   target_file="$DIRECT_FILE" ;;
+        *)
+            echo "Error: unknown list '$list_name'. Use approved or direct."
+            exit 1
+            ;;
+    esac
+
+    acquire_lock || exit 1
+
+    if domain_in_file "$domain" "$target_file"; then
+        local tmpf="${target_file}.tmp"
+        grep -vxF "$domain" "$target_file" > "$tmpf" 2>/dev/null || true
+        mv "$tmpf" "$target_file"
+        echo "Removed from $list_name: $domain"
+    else
+        echo "'$domain' is not in the $list_name list."
+    fi
+
+    release_lock
+}
+
+cmd_clear() {
+    local which="${1:-pending}"
+    case "$which" in
+        pending)
+            > "$PENDING_FILE"
+            echo "Pending list cleared."
+            ;;
+        approved)
+            > "$APPROVED_FILE"
+            echo "Approved list cleared."
+            ;;
+        direct)
+            > "$DIRECT_FILE"
+            echo "Direct list cleared."
+            ;;
+        ignored)
+            > "$IGNORED_FILE"
+            echo "Ignored list cleared."
+            ;;
+        *)
+            echo "Error: unknown list '$which'. Use pending, approved, direct, or ignored."
+            exit 1
+            ;;
+    esac
+}
+
+cmd_reset() {
+    echo "Resetting trafficrule state..."
+    > "$PENDING_FILE"
+    rm -rf "${SESSION_TMP_DIR:?}/"*
+    rm -f "$ACTIVE_SESSION_FILE"
+    echo "Cleared: pending list, all session temp data, active session."
+    echo "Note: approved and ignored lists are preserved. Use 'clear' to remove them."
+}
+
+# ──────────────────────────────────────────────
+# Apply to OpenClash
+# ──────────────────────────────────────────────
+
+cmd_apply() {
+    local has_proxy=0
+    local has_direct=0
+    [ -s "$APPROVED_FILE" ] && has_proxy=1
+    [ -s "$DIRECT_FILE" ] && has_direct=1
+
+    if [ "$has_proxy" = "0" ] && [ "$has_direct" = "0" ]; then
+        echo "No entries to apply (both proxy and direct lists are empty)."
+        return
+    fi
+
+    local rule_dir
+    rule_dir="$(dirname "$RULE_PROVIDER_FILE")"
+    mkdir -p "$rule_dir"
+
+    # Helper: split a list file into domains and IPs, generate YAML files
+    # Outputs a single line "has_domains has_ips" (0 or 1) on stdout
+    # Status messages go to fd 3 (connected to original stdout by caller)
+    generate_rule_files() {
+        local src_file="$1"
+        local domain_yaml="$2"
+        local ip_yaml="$3"
+
+        local has_domains=0
+        local has_ips=0
+
+        # Separate domains from IPs
+        local tmp_domains="${src_file}.domains.tmp"
+        local tmp_ips="${src_file}.ips.tmp"
+        > "$tmp_domains"
+        > "$tmp_ips"
+
+        sort -u "$src_file" | while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            if is_ipv4 "$entry"; then
+                echo "$entry" >> "$tmp_ips"
+            else
+                echo "$entry" >> "$tmp_domains"
+            fi
+        done
+
+        # Generate domain rule-provider YAML
+        if [ -s "$tmp_domains" ]; then
+            has_domains=1
+            echo "payload:" > "$domain_yaml"
+            while IFS= read -r d; do
+                echo "  - $d" >> "$domain_yaml"
+            done < "$tmp_domains"
+            local dcount
+            dcount="$(wc -l < "$tmp_domains" | tr -d ' ')"
+            echo "Generated $domain_yaml ($dcount domains)" >&3
+        fi
+
+        # Generate IP rule-provider YAML (ipcidr behavior: entries as IP/32)
+        if [ -s "$tmp_ips" ]; then
+            has_ips=1
+            echo "payload:" > "$ip_yaml"
+            while IFS= read -r ip; do
+                echo "  - $ip/32" >> "$ip_yaml"
+            done < "$tmp_ips"
+            local icount
+            icount="$(wc -l < "$tmp_ips" | tr -d ' ')"
+            echo "Generated $ip_yaml ($icount IPs)" >&3
+        fi
+
+        rm -f "$tmp_domains" "$tmp_ips"
+
+        # Return via stdout: "has_domains has_ips"
+        echo "$has_domains $has_ips"
+    }
+
+    # Open fd 3 to original stdout for status messages
+    exec 3>&1
+
+    # Generate proxy rule files
+    local proxy_result="0 0"
+    if [ "$has_proxy" = "1" ]; then
+        proxy_result="$(generate_rule_files "$APPROVED_FILE" "$RULE_PROVIDER_FILE" "$IP_RULE_PROVIDER_FILE")"
+    fi
+    local proxy_has_domains proxy_has_ips
+    proxy_has_domains="$(echo "$proxy_result" | awk '{print $1}')"
+    proxy_has_ips="$(echo "$proxy_result" | awk '{print $2}')"
+
+    # Generate direct rule files
+    local direct_result="0 0"
+    if [ "$has_direct" = "1" ]; then
+        direct_result="$(generate_rule_files "$DIRECT_FILE" "$DIRECT_RULE_PROVIDER_FILE" "$DIRECT_IP_RULE_PROVIDER_FILE")"
+    fi
+    local direct_has_domains direct_has_ips
+    direct_has_domains="$(echo "$direct_result" | awk '{print $1}')"
+    direct_has_ips="$(echo "$direct_result" | awk '{print $2}')"
+
+    # Close fd 3
+    exec 3>&-
+
+    # Register domain rule-providers (behavior=domain)
+    register_rule_provider "trafficrule_proxy" "$RULE_PROVIDER_FILE" "$TR_PROXY_GROUP" "$proxy_has_domains" "domain"
+    register_rule_provider "trafficrule_direct" "$DIRECT_RULE_PROVIDER_FILE" "$TR_DIRECT_GROUP" "$direct_has_domains" "domain"
+
+    # Register IP rule-providers (behavior=ipcidr)
+    register_rule_provider "trafficrule_proxy_ip" "$IP_RULE_PROVIDER_FILE" "$TR_PROXY_GROUP" "$proxy_has_ips" "ipcidr"
+    register_rule_provider "trafficrule_direct_ip" "$DIRECT_IP_RULE_PROVIDER_FILE" "$TR_DIRECT_GROUP" "$direct_has_ips" "ipcidr"
+
+    # Ensure custom clash rules are enabled
+    local custom_rules
+    custom_rules="$(uci -q get openclash.config.enable_custom_clash_rules)"
+    if [ "$custom_rules" != "1" ]; then
+        uci set openclash.config.enable_custom_clash_rules='1'
+        uci commit openclash
+        echo "Enabled openclash custom_clash_rules."
+    fi
+
+    # Optionally reload OpenClash
+    if [ "$TR_AUTO_RELOAD" = "1" ]; then
+        echo "Restarting OpenClash..."
+        /etc/init.d/openclash restart
+    else
+        echo "Auto-reload is off. Run '/etc/init.d/openclash restart' to apply rules."
+    fi
+}
+
+register_rule_provider() {
+    local rp_name="$1"
+    local rp_file="$2"
+    local rp_group="$3"
+    local has_data="$4"
+    local rp_behavior="${5:-domain}"
+
+    [ "$has_data" = "0" ] && return
+
+    local rp_path="./rule_provider/$(basename "$rp_file")"
+
+    # Check if this rule-provider already exists in UCI
+    local found=0
+    local idx=0
+    while true; do
+        local name
+        name="$(uci -q get "openclash.@rule_providers[$idx].name")"
+        [ -z "$name" ] && break
+        if [ "$name" = "$rp_name" ]; then
+            found=1
+            # Update group and behavior in case they changed
+            uci set "openclash.@rule_providers[$idx].group=${rp_group}"
+            uci set "openclash.@rule_providers[$idx].behavior=${rp_behavior}"
+            uci commit openclash
+            break
+        fi
+        idx=$((idx + 1))
+    done
+
+    if [ "$found" = "0" ]; then
+        echo "Registering $rp_name rule-provider in OpenClash UCI..."
+        uci add openclash rule_providers >/dev/null
+        uci set "openclash.@rule_providers[-1].enabled=1"
+        uci set "openclash.@rule_providers[-1].name=${rp_name}"
+        uci set "openclash.@rule_providers[-1].type=file"
+        uci set "openclash.@rule_providers[-1].behavior=${rp_behavior}"
+        uci set "openclash.@rule_providers[-1].format=yaml"
+        uci set "openclash.@rule_providers[-1].path=${rp_path}"
+        uci set "openclash.@rule_providers[-1].group=${rp_group}"
+        uci set "openclash.@rule_providers[-1].position=1"
+        uci commit openclash
+        echo "Rule-provider '$rp_name' registered (behavior=$rp_behavior, group=$rp_group)."
+    else
+        echo "Rule-provider '$rp_name' already registered in UCI."
+    fi
+}
+
+# ──────────────────────────────────────────────
+# Session management
+# ──────────────────────────────────────────────
+
+cmd_session() {
+    local subcmd="$1"
+    shift 2>/dev/null
+
+    case "$subcmd" in
+        start)
+            session_start "$@"
+            ;;
+        stop)
+            session_stop
+            ;;
+        status)
+            session_status
+            ;;
+        list)
+            session_list
+            ;;
+        show)
+            session_show "$@"
+            ;;
+        delete)
+            session_delete "$@"
+            ;;
+        *)
+            echo "Error: unknown session subcommand '$subcmd'"
+            echo "Available: start, stop, status, list, show, delete"
+            exit 1
+            ;;
+    esac
+}
+
+session_start() {
+    local name="$1"
+    [ -z "$name" ] && { echo "Error: specify a session name"; exit 1; }
+
+    # Validate name (alphanumeric, dash, underscore only)
+    case "$name" in
+        *[!a-zA-Z0-9_-]*)
+            echo "Error: session name may only contain letters, numbers, dashes, underscores."
+            exit 1
+            ;;
+    esac
+
+    local current
+    current="$(get_active_session)"
+    if [ -n "$current" ]; then
+        echo "Error: session '$current' is already active. Stop it first."
+        exit 1
+    fi
+
+    echo "$name" > "$ACTIVE_SESSION_FILE"
+    touch "${SESSION_TMP_DIR}/${name}.txt"
+
+    # Write session metadata
+    local meta="${SESSION_ETC_DIR}/${name}.meta"
+    if [ ! -f "$meta" ]; then
+        cat > "$meta" <<META
+created=$(date '+%Y-%m-%d %H:%M:%S')
+domain_count=0
+status=active
+META
+    else
+        # Re-opening existing session
+        sed -i "s/^status=.*/status=active/" "$meta"
+    fi
+
+    echo "Session '$name' started. Captured domains will be tagged."
+    echo "Use 'trafficrule session stop' to end this session."
+}
+
+session_stop() {
+    local current
+    current="$(get_active_session)"
+    if [ -z "$current" ]; then
+        echo "No active session."
+        return
+    fi
+
+    rm -f "$ACTIVE_SESSION_FILE"
+
+    # Update session metadata
+    local meta="${SESSION_ETC_DIR}/${current}.meta"
+    local sfile="${SESSION_TMP_DIR}/${current}.txt"
+    local dcount
+    dcount="$(count_lines "$sfile")"
+
+    if [ -f "$meta" ]; then
+        sed -i "s/^status=.*/status=closed/" "$meta"
+        sed -i "s/^domain_count=.*/domain_count=${dcount}/" "$meta"
+    fi
+
+    echo "Session '$current' stopped ($dcount domains captured)."
+}
+
+session_status() {
+    local current
+    current="$(get_active_session)"
+    if [ -n "$current" ]; then
+        local sfile="${SESSION_TMP_DIR}/${current}.txt"
+        echo "Active session: $current"
+        echo "Domains captured: $(count_lines "$sfile")"
+    else
+        echo "No active session."
+    fi
+}
+
+session_list() {
+    echo "=== Sessions ==="
+
+    local found=0
+    local current
+    current="$(get_active_session)"
+
+    # List from metadata files
+    for meta in "$SESSION_ETC_DIR"/*.meta; do
+        [ -f "$meta" ] || continue
+        found=1
+        local name
+        name="$(basename "$meta" .meta)"
+        local status="" created="" dcount=""
+        while IFS='=' read -r key val; do
+            case "$key" in
+                status) status="$val" ;;
+                created) created="$val" ;;
+                domain_count) dcount="$val" ;;
+            esac
+        done < "$meta"
+
+        # Update domain count from live data if available
+        local sfile="${SESSION_TMP_DIR}/${name}.txt"
+        [ -f "$sfile" ] && dcount="$(count_lines "$sfile")"
+
+        local marker=""
+        [ "$name" = "$current" ] && marker=" [ACTIVE]"
+
+        printf "  %-20s %s  domains: %s  created: %s%s\n" \
+            "$name" "$status" "${dcount:-0}" "${created:-unknown}" "$marker"
+    done
+
+    # Also check tmp sessions without metadata
+    for sfile in "$SESSION_TMP_DIR"/*.txt; do
+        [ -f "$sfile" ] || continue
+        local name
+        name="$(basename "$sfile" .txt)"
+        local meta="${SESSION_ETC_DIR}/${name}.meta"
+        [ -f "$meta" ] && continue  # Already listed above
+        found=1
+        local dcount
+        dcount="$(count_lines "$sfile")"
+        local marker=""
+        [ "$name" = "$current" ] && marker=" [ACTIVE]"
+        printf "  %-20s (no metadata)  domains: %s%s\n" "$name" "$dcount" "$marker"
+    done
+
+    [ "$found" = "0" ] && echo "  (no sessions)"
+}
+
+session_show() {
+    local name="$1"
+    [ -z "$name" ] && { echo "Error: specify a session name"; exit 1; }
+
+    local sfile="${SESSION_TMP_DIR}/${name}.txt"
+    if [ ! -f "$sfile" ]; then
+        echo "Error: session '$name' not found (no captured data)."
+        exit 1
+    fi
+
+    if [ ! -s "$sfile" ]; then
+        echo "Session '$name': (no domains captured)"
+        return
+    fi
+
+    echo "=== Session '$name' ($(count_lines "$sfile") domains) ==="
+    sort "$sfile"
+}
+
+session_delete() {
+    local name="$1"
+    [ -z "$name" ] && { echo "Error: specify a session name"; exit 1; }
+
+    local current
+    current="$(get_active_session)"
+    if [ "$name" = "$current" ]; then
+        rm -f "$ACTIVE_SESSION_FILE"
+    fi
+
+    rm -f "${SESSION_TMP_DIR}/${name}.txt"
+    rm -f "${SESSION_ETC_DIR}/${name}.meta"
+
+    echo "Session '$name' deleted."
+}
+
+# ──────────────────────────────────────────────
+# Main dispatcher
+# ──────────────────────────────────────────────
+
+cmd="$1"
+shift 2>/dev/null
+
+case "$cmd" in
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    status)  cmd_status ;;
+    monitor) cmd_monitor "$@" ;;
+    devices) cmd_devices ;;
+    list)    cmd_list "$@" ;;
+    approve) cmd_approve "$@" ;;
+    direct)  cmd_direct "$@" ;;
+    ignore)  cmd_ignore "$@" ;;
+    remove)  cmd_remove "$@" ;;
+    apply)   cmd_apply ;;
+    clear)   cmd_clear "$@" ;;
+    reset)   cmd_reset ;;
+    session) cmd_session "$@" ;;
+    help|-h|--help|"")
+        usage
+        ;;
+    *)
+        echo "Error: unknown command '$cmd'"
+        usage
+        ;;
+esac

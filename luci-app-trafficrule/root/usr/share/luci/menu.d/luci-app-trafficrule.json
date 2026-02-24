@@ -1,0 +1,28 @@
+{
+	"admin/services/trafficrule": {
+		"title": "TrafficRule",
+		"order": 60,
+		"action": { "type": "firstchild" },
+		"depends": { "acl": ["luci-app-trafficrule"] }
+	},
+	"admin/services/trafficrule/overview": {
+		"title": "Overview",
+		"order": 1,
+		"action": { "type": "view", "path": "trafficrule/overview" }
+	},
+	"admin/services/trafficrule/capture": {
+		"title": "Capture",
+		"order": 2,
+		"action": { "type": "view", "path": "trafficrule/capture" }
+	},
+	"admin/services/trafficrule/rules": {
+		"title": "Rules",
+		"order": 3,
+		"action": { "type": "view", "path": "trafficrule/rules" }
+	},
+	"admin/services/trafficrule/settings": {
+		"title": "Settings",
+		"order": 4,
+		"action": { "type": "view", "path": "trafficrule/settings" }
+	}
+}

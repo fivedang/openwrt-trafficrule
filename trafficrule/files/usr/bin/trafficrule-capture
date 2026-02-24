@@ -1,0 +1,117 @@
+#!/bin/sh
+# trafficrule-capture - tcpdump capture daemon
+# Managed by procd; do not run manually.
+
+. /lib/functions.sh
+. /usr/lib/trafficrule/common.sh
+
+load_config
+ensure_dirs
+
+if [ -z "$TR_TARGET_IP" ]; then
+    log_msg err "target_ip is not configured"
+    exit 1
+fi
+
+IFACE="$TR_INTERFACE"
+TARGET="$TR_TARGET_IP"
+
+log_msg info "Starting capture on $IFACE for $TARGET (dns=$TR_CAPTURE_DNS, sni=$TR_CAPTURE_SNI, ip=$TR_CAPTURE_IP)"
+
+DNS_PID=""
+SNI_PID=""
+IP_PID=""
+PID_DIR="/tmp/trafficrule"
+
+cleanup() {
+    log_msg info "Stopping capture processes"
+    [ -n "$DNS_PID" ] && kill "$DNS_PID" 2>/dev/null
+    [ -n "$SNI_PID" ] && kill "$SNI_PID" 2>/dev/null
+    [ -n "$IP_PID" ] && kill "$IP_PID" 2>/dev/null
+    rm -f "$PID_DIR/dns.pid" "$PID_DIR/sni.pid" "$PID_DIR/ip.pid"
+    wait
+    exit 0
+}
+
+trap cleanup INT TERM
+
+# Start DNS capture
+if [ "$TR_CAPTURE_DNS" = "1" ]; then
+    tcpdump -l -n -i "$IFACE" -s 512 \
+        "src host $TARGET and udp port 53 and udp[10] & 0x80 = 0" 2>/dev/null \
+        | /usr/lib/trafficrule/dns_parser.sh &
+    DNS_PID=$!
+    echo "$DNS_PID" > "$PID_DIR/dns.pid"
+    log_msg info "DNS capture started (PID $DNS_PID)"
+fi
+
+# Start TLS SNI capture
+if [ "$TR_CAPTURE_SNI" = "1" ]; then
+    # Prefer compiled sniextract binary if available
+    if [ -x /usr/bin/sniextract ]; then
+        SNI_HANDLER="/usr/bin/sniextract"
+    else
+        SNI_HANDLER="/usr/lib/trafficrule/sni_parser.sh"
+    fi
+
+    if [ "$SNI_HANDLER" = "/usr/bin/sniextract" ]; then
+        # sniextract handles raw hex output and prints domains to stdout
+        # We wrap with a small loop to call add_pending_domain for each line
+        tcpdump -l -n -x -i "$IFACE" -s 512 \
+            "src host $TARGET and tcp dst port 443 and tcp[((tcp[12]&0xf0)>>2)]=0x16 and tcp[((tcp[12]&0xf0)>>2)+5]=0x01" 2>/dev/null \
+            | /usr/bin/sniextract \
+            | while read -r domain; do
+                . /usr/lib/trafficrule/common.sh
+                . /lib/functions.sh
+                load_config
+                add_pending_domain "$domain"
+            done &
+        SNI_PID=$!
+    else
+        tcpdump -l -n -x -i "$IFACE" -s 512 \
+            "src host $TARGET and tcp dst port 443 and tcp[((tcp[12]&0xf0)>>2)]=0x16 and tcp[((tcp[12]&0xf0)>>2)+5]=0x01" 2>/dev/null \
+            | "$SNI_HANDLER" &
+        SNI_PID=$!
+    fi
+    echo "$SNI_PID" > "$PID_DIR/sni.pid"
+    log_msg info "SNI capture started (PID $SNI_PID, handler: $SNI_HANDLER)"
+fi
+
+# Start destination IP capture (TCP SYN packets from target)
+if [ "$TR_CAPTURE_IP" = "1" ]; then
+    tcpdump -l -n -i "$IFACE" -s 68 \
+        "src host $TARGET and tcp[tcpflags] & (tcp-syn) != 0 and tcp[tcpflags] & (tcp-ack) = 0" 2>/dev/null \
+        | while read -r line; do
+            # Extract destination IP from tcpdump output
+            # Format: "HH:MM:SS.xxx IP src.port > dst.port: Flags [S], ..."
+            dst_ip="$(echo "$line" | awk '{
+                for (i = 1; i <= NF; i++) {
+                    if ($i == ">") {
+                        dst = $(i+1)
+                        # Remove trailing colon and port
+                        sub(/:$/, "", dst)
+                        n = split(dst, parts, ".")
+                        if (n >= 5) {
+                            # IP is parts[1].parts[2].parts[3].parts[4], last part is port
+                            printf "%s.%s.%s.%s", parts[1], parts[2], parts[3], parts[4]
+                        }
+                        exit
+                    }
+                }
+            }')"
+            if [ -n "$dst_ip" ]; then
+                . /usr/lib/trafficrule/common.sh
+                . /lib/functions.sh
+                load_config
+                add_pending_ip "$dst_ip"
+            fi
+        done &
+    IP_PID=$!
+    echo "$IP_PID" > "$PID_DIR/ip.pid"
+    log_msg info "IP capture started (PID $IP_PID)"
+fi
+
+# Wait for any child to exit; if one dies, cleanup and let procd respawn
+wait -n 2>/dev/null || wait
+log_msg warn "A capture process exited, shutting down for procd respawn"
+cleanup

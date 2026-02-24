@@ -1,0 +1,4 @@
+*.o
+*.ipk
+*.tmp
+.DS_Store
