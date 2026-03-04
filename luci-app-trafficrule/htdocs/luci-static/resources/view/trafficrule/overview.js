@@ -5,7 +5,7 @@
 'require dom';
 'require poll';
 
-var APP_VERSION = '1.2.0';
+var APP_VERSION = '1.3.0';
 
 var callGetStatus = rpc.declare({
 	object: 'luci.trafficrule',

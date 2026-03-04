@@ -17,6 +17,7 @@ RULE_PROVIDER_FILE="/etc/openclash/rule_provider/trafficrule_proxy.yaml"
 DIRECT_RULE_PROVIDER_FILE="/etc/openclash/rule_provider/trafficrule_direct.yaml"
 IP_RULE_PROVIDER_FILE="/etc/openclash/rule_provider/trafficrule_proxy_ip.yaml"
 DIRECT_IP_RULE_PROVIDER_FILE="/etc/openclash/rule_provider/trafficrule_direct_ip.yaml"
+CUSTOM_RULES_2_FILE="/etc/openclash/custom/openclash_custom_rules_2.list"
 
 # UCI config variables (populated by load_config)
 TR_ENABLED=""
@@ -35,7 +36,7 @@ load_config() {
     config_get TR_ENABLED global enabled "0"
     config_get TR_TARGET_IP global target_ip ""
     config_get TR_INTERFACE global interface "br-lan"
-    config_get TR_PROXY_GROUP global proxy_group "Proxy"
+    config_get TR_PROXY_GROUP global proxy_group "♻️ 自动选择"
     config_get TR_DIRECT_GROUP global direct_group "DIRECT"
     config_get TR_AUTO_RELOAD global auto_reload_clash "0"
     config_get TR_CAPTURE_DNS global capture_dns "1"

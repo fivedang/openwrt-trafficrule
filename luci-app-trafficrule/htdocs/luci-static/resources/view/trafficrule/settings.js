@@ -5,7 +5,7 @@
 'require uci';
 'require dom';
 
-var APP_VERSION = '1.2.0';
+var APP_VERSION = '1.3.0';
 
 var callGetProxyGroups = rpc.declare({
 	object: 'luci.trafficrule',
@@ -45,10 +45,7 @@ return view.extend({
 		for (var i = 0; i < proxyGroups.length; i++) {
 			o.value(proxyGroups[i], proxyGroups[i]);
 		}
-		if (proxyGroups.indexOf('Proxy') === -1) {
-			o.value('Proxy', 'Proxy');
-		}
-		o.default = 'Proxy';
+		o.default = '♻️ 自动选择';
 		o.rmempty = false;
 
 		o = s.option(form.ListValue, 'direct_group', 'Direct Group',

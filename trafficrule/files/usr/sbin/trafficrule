@@ -112,12 +112,12 @@ cmd_status() {
     else
         echo "Proxy rule provider: not generated yet"
     fi
-    if [ -f "$DIRECT_RULE_PROVIDER_FILE" ]; then
+    if [ -f "$CUSTOM_RULES_2_FILE" ]; then
         local dcount
-        dcount="$(grep -c '^ *- ' "$DIRECT_RULE_PROVIDER_FILE" 2>/dev/null || echo 0)"
-        echo "Direct rule provider: $DIRECT_RULE_PROVIDER_FILE ($dcount domains)"
+        dcount="$(sed -n '/trafficrule direct rules begin/,/trafficrule direct rules end/p' "$CUSTOM_RULES_2_FILE" | grep -c '^- ' 2>/dev/null || echo 0)"
+        echo "Direct custom rules: $CUSTOM_RULES_2_FILE ($dcount rules)"
     else
-        echo "Direct rule provider: not generated yet"
+        echo "Direct custom rules: not generated yet"
     fi
 }
 
@@ -507,6 +507,89 @@ cmd_reset() {
 # Apply to OpenClash
 # ──────────────────────────────────────────────
 
+# Write direct domains/IPs as custom rules in openclash_custom_rules_2.list
+# Uses marker lines to manage trafficrule's section without affecting user rules
+write_direct_custom_rules() {
+    local direct_group="$1"
+    local begin_marker="# --- trafficrule direct rules begin ---"
+    local end_marker="# --- trafficrule direct rules end ---"
+
+    # Ensure the custom rules directory exists
+    local custom_dir
+    custom_dir="$(dirname "$CUSTOM_RULES_2_FILE")"
+    mkdir -p "$custom_dir"
+    [ -f "$CUSTOM_RULES_2_FILE" ] || touch "$CUSTOM_RULES_2_FILE"
+
+    # Remove existing trafficrule section (if any)
+    local tmpf="${CUSTOM_RULES_2_FILE}.tmp"
+    sed "/${begin_marker}/,/${end_marker}/d" "$CUSTOM_RULES_2_FILE" > "$tmpf"
+
+    if [ -s "$DIRECT_FILE" ]; then
+        # Build the new rules block
+        local rules_block="${TRAFFICRULE_TMP}/direct_rules_block.tmp"
+        echo "$begin_marker" > "$rules_block"
+
+        local domain_count=0
+        local ip_count=0
+        sort -u "$DIRECT_FILE" | while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            if is_ipv4 "$entry"; then
+                echo "- IP-CIDR,$entry/32,$direct_group" >> "$rules_block"
+            else
+                echo "- DOMAIN-SUFFIX,$entry,$direct_group" >> "$rules_block"
+            fi
+        done
+
+        echo "$end_marker" >> "$rules_block"
+
+        # Append rules block to the cleaned file
+        cat "$rules_block" >> "$tmpf"
+        rm -f "$rules_block"
+
+        # Count for reporting
+        domain_count="$(grep -c '^- DOMAIN' "$tmpf" 2>/dev/null || echo 0)"
+        ip_count="$(grep -c '^- IP-CIDR' "$tmpf" 2>/dev/null || echo 0)"
+        echo "Written $domain_count domain + $ip_count IP direct rules to custom_rules_2."
+    else
+        echo "Direct list empty, cleared custom_rules_2 trafficrule section."
+    fi
+
+    mv "$tmpf" "$CUSTOM_RULES_2_FILE"
+}
+
+# Clean up legacy direct rule_provider entries from UCI and old YAML files
+cleanup_direct_providers() {
+    local cleaned=0
+
+    # Remove UCI rule_provider entries named trafficrule_direct / trafficrule_direct_ip
+    local idx=0
+    while true; do
+        local name
+        name="$(uci -q get "openclash.@rule_providers[$idx].name")"
+        [ -z "$name" ] && break
+        if [ "$name" = "trafficrule_direct" ] || [ "$name" = "trafficrule_direct_ip" ]; then
+            uci delete "openclash.@rule_providers[$idx]" 2>/dev/null
+            uci commit openclash
+            echo "Removed legacy UCI rule_provider: $name"
+            cleaned=1
+            # Don't increment idx — the list shifted
+            continue
+        fi
+        idx=$((idx + 1))
+    done
+
+    # Remove old YAML files
+    for f in "$DIRECT_RULE_PROVIDER_FILE" "$DIRECT_IP_RULE_PROVIDER_FILE"; do
+        if [ -f "$f" ]; then
+            rm -f "$f"
+            echo "Removed legacy file: $f"
+            cleaned=1
+        fi
+    done
+
+    [ "$cleaned" = "1" ] && echo "Legacy direct rule_provider cleanup done."
+}
+
 cmd_apply() {
     local has_proxy=0
     local has_direct=0
@@ -590,25 +673,18 @@ cmd_apply() {
     proxy_has_domains="$(echo "$proxy_result" | awk '{print $1}')"
     proxy_has_ips="$(echo "$proxy_result" | awk '{print $2}')"
 
-    # Generate direct rule files
-    local direct_result="0 0"
-    if [ "$has_direct" = "1" ]; then
-        direct_result="$(generate_rule_files "$DIRECT_FILE" "$DIRECT_RULE_PROVIDER_FILE" "$DIRECT_IP_RULE_PROVIDER_FILE")"
-    fi
-    local direct_has_domains direct_has_ips
-    direct_has_domains="$(echo "$direct_result" | awk '{print $1}')"
-    direct_has_ips="$(echo "$direct_result" | awk '{print $2}')"
-
     # Close fd 3
     exec 3>&-
 
-    # Register domain rule-providers (behavior=domain)
+    # Register proxy rule-providers (behavior=domain and ipcidr)
     register_rule_provider "trafficrule_proxy" "$RULE_PROVIDER_FILE" "$TR_PROXY_GROUP" "$proxy_has_domains" "domain"
-    register_rule_provider "trafficrule_direct" "$DIRECT_RULE_PROVIDER_FILE" "$TR_DIRECT_GROUP" "$direct_has_domains" "domain"
-
-    # Register IP rule-providers (behavior=ipcidr)
     register_rule_provider "trafficrule_proxy_ip" "$IP_RULE_PROVIDER_FILE" "$TR_PROXY_GROUP" "$proxy_has_ips" "ipcidr"
-    register_rule_provider "trafficrule_direct_ip" "$DIRECT_IP_RULE_PROVIDER_FILE" "$TR_DIRECT_GROUP" "$direct_has_ips" "ipcidr"
+
+    # Direct rules: write to custom_rules_2.list instead of rule_provider
+    write_direct_custom_rules "$TR_DIRECT_GROUP"
+
+    # Clean up any legacy direct rule_provider entries
+    cleanup_direct_providers
 
     # Ensure custom clash rules are enabled
     local custom_rules
@@ -648,9 +724,10 @@ register_rule_provider() {
         [ -z "$name" ] && break
         if [ "$name" = "$rp_name" ]; then
             found=1
-            # Update group and behavior in case they changed
+            # Update group, behavior, and config scope in case they changed
             uci set "openclash.@rule_providers[$idx].group=${rp_group}"
             uci set "openclash.@rule_providers[$idx].behavior=${rp_behavior}"
+            uci set "openclash.@rule_providers[$idx].config=all"
             uci commit openclash
             break
         fi
@@ -667,6 +744,7 @@ register_rule_provider() {
         uci set "openclash.@rule_providers[-1].format=yaml"
         uci set "openclash.@rule_providers[-1].path=${rp_path}"
         uci set "openclash.@rule_providers[-1].group=${rp_group}"
+        uci set "openclash.@rule_providers[-1].config=all"
         uci set "openclash.@rule_providers[-1].position=1"
         uci commit openclash
         echo "Rule-provider '$rp_name' registered (behavior=$rp_behavior, group=$rp_group)."
